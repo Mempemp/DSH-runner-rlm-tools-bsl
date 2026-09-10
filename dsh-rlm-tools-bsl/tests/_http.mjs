@@ -164,6 +164,38 @@ try {
   check("сервер поднят для проверки dispose", beforeDispose.data?.server?.running === true && beforeDispose.data.server.managed === true);
   for (const dispose of disposers) await dispose();
   check("dispose гасит управляемый процесс", !(await reachable(`http://127.0.0.1:${PORT}/health`)));
+
+  // ── 8. недоступная команда: ошибка без ожидания таймаута ─────────────────
+  const routes2 = [];
+  const ctx2 = {
+    webServer: { register: (spec) => routes2.push(spec) },
+    effect: () => {},
+    on: () => {},
+    logger: { info: () => {} },
+  };
+  const t0 = Date.now();
+  plugin.apply(ctx2, { port: PORT + 1, command: "C:\\нет\\такого\\rlm-tools-bsl.exe" });
+  const server2 = createServer(async (req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const route = routes2.find((item) => item.kind === "exact" && item.path === url.pathname);
+    if (!route) {
+      res.writeHead(404).end();
+      return;
+    }
+    await route.handler(req, res);
+  });
+  await new Promise((done) => server2.listen(0, "127.0.0.1", done));
+  const base2 = "http://127.0.0.1:" + server2.address().port;
+  let failedState = null;
+  const until = Date.now() + 20000;
+  while (Date.now() < until) {
+    failedState = await fetch(base2 + "/rlm/state").then((r) => r.json()).catch(() => null);
+    if (failedState && !failedState.server.running && failedState.server.lastError) break;
+    await new Promise((done) => setTimeout(done, 300));
+  }
+  check("недоступная команда: ошибка видна без ожидания таймаута", Date.now() - t0 < 15000, ((Date.now() - t0) / 1000).toFixed(1) + " с");
+  check("текст ошибки объясняет причину", /не удалось запустить|завершился сам/.test(String(failedState?.server?.lastError)), String(failedState?.server?.lastError).slice(0, 90));
+  await new Promise((done) => server2.close(done));
 } catch (error) {
   console.log("FAIL — исключение в сценарии: " + (error?.stack || error));
   exitCode = 1;

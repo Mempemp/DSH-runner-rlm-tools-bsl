@@ -18,6 +18,7 @@ const ROUTE = "/rlm";
 const SERVER_NAME = "rlm-tools-bsl";
 const MCP_SERVER_NAME = "rlm";
 const HOST = "127.0.0.1";
+const PLUGIN_VERSION = "0.1.1";
 const SCHEMA = "dsh-rlm-tools-bsl/v1";
 const DEFAULT_PORT = 9330;
 const START_TIMEOUT_MS = 30_000;
@@ -132,6 +133,14 @@ function readSettings() {
     if (raw[key] !== undefined) out[key] = raw[key];
   }
   return out;
+}
+
+// Каталог логов сервера обязателен для записи: под файловой песочницей DSH сервер
+// падает с кодом 1 и PermissionError. Подсказка полезнее кода выхода — показываем её.
+function writeHint() {
+  const tail = tailLines(LOG_FILE, 60).join("\n");
+  if (!/PermissionError|Access is denied|WinError 5\b/i.test(tail)) return "";
+  return " — каталог .config\\rlm-tools-bsl недоступен для записи: добавьте его в разрешённые пути DSH или задайте RLM_CONFIG_FILE и RLM_INDEX_DIR в переменных окружения плагина";
 }
 
 // ── конфигурация запуска ───────────────────────────────────────────────────
@@ -309,7 +318,7 @@ async function probeIdentity(port, timeoutMs = PROBE_TIMEOUT_MS) {
         jsonrpc: "2.0",
         id: 1,
         method: "initialize",
-        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: name, version: "0.1.0" } },
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: name, version: PLUGIN_VERSION } },
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -449,6 +458,13 @@ async function startServer(rt) {
       });
       child.on("error", (error) => {
         rt.lastError = "не удалось запустить процесс: " + (error?.message || String(error));
+        // Процесс не запустился (нет pid) — состоянием не управляем, иначе статус «работает» врёт.
+        if (!child.pid && rt.child === child) {
+          rt.child = null;
+          rt.childPid = null;
+          rt.startedAt = null;
+          rt.version = null;
+        }
       });
     } finally {
       closeSync(handle);
@@ -467,11 +483,14 @@ async function startServer(rt) {
       }
       await sleep(400);
     }
-    if (rt.child && !rt.version && !rt.lastError) {
-      const owner = portOwner(config.port, true);
-      rt.lastError = owner && owner.pid !== rt.childPid
-        ? `порт ${config.port} занят процессом ${owner.image ?? "?"} (pid ${owner.pid})`
-        : `сервер не ответил за ${Math.round(START_TIMEOUT_MS / 1000)} с; хвост лога — ниже`;
+    if (!rt.version) {
+      if (!rt.lastError) {
+        const owner = portOwner(config.port, true);
+        rt.lastError = owner && owner.pid !== rt.childPid
+          ? `порт ${config.port} занят процессом ${owner.image ?? "?"} (pid ${owner.pid})`
+          : `сервер не ответил за ${Math.round(START_TIMEOUT_MS / 1000)} с; хвост лога — ниже`;
+      }
+      rt.lastError += writeHint();
     }
     return snapshot(rt);
   } finally {

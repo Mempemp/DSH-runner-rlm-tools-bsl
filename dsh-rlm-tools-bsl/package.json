@@ -1,6 +1,6 @@
 {
   "name": "dsh-rlm-tools-bsl",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "rlm-tools-bsl — MCP-сервер анализа кода 1С — поднимается вместе с DeepSeek Harness и гасится вместе с ним: вкладка настроек со статусом, ручным управлением и логом.",
   "keywords": [
     "dsh",

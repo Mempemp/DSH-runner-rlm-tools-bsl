@@ -61,6 +61,8 @@ http://127.0.0.1:9330/mcp
 Имя `rlm` даёт инструменты `mcp__rlm__rlm_start`, `mcp__rlm__rlm_execute`, `mcp__rlm__rlm_help`, `mcp__rlm__rlm_projects`, `mcp__rlm__rlm_index`, `mcp__rlm__rlm_end`.
 
 > Порт в URL должен совпадать с портом из вкладки (по умолчанию 9330).
+>
+> Имя файла и имена полей задаёт сам MCP-менеджер: у `dsh-mcp-manager` это `$DSH_HOME/mcp-servers.json` с полем `serverName`; в других сборках менеджера встречается `$DSH_HOME/dsh-mcp.json` с полем `name`. Если формат не совпадает — добавьте сервер через UI (Способ 1): менеджер запишет файл в своём формате сам.
 
 **Способ 3 — статическая строка профиля** (если MCP-менеджер не используется) — в `~/.dsh/profiles/web/cordis.patch.yml`:
 
@@ -74,7 +76,7 @@ http://127.0.0.1:9330/mcp
         url: http://127.0.0.1:9330/mcp
 ```
 
-Способы 1 и 3 не комбинируйте: два MCP-сервера с одинаковым `serverName` конфликтуют.
+Способ 3 не зависит от MCP-менеджера — это подключение средствами самого DSH. Способы 1 и 3 не комбинируйте: два MCP-сервера с одинаковым `serverName` конфликтуют.
 
 ## Установка
 
@@ -83,10 +85,10 @@ http://127.0.0.1:9330/mcp
 **Из релиза** (скачивать ничего не нужно):
 
 ```sh
-dsh plugin --profile web add https://github.com/Mempemp/DSH-runner-rlm-tools-bsl/releases/download/v0.1.0/dsh-rlm-tools-bsl-0.1.0.tgz
+dsh plugin --profile web add https://github.com/Mempemp/DSH-runner-rlm-tools-bsl/releases/download/v0.1.1/dsh-rlm-tools-bsl-0.1.1.tgz
 ```
 
-**Локальный архив** `dsh-rlm-tools-bsl-0.1.0.tgz` (скачан со страницы релизов или собран самому: `cd dsh-rlm-tools-bsl && npm pack`):
+**Локальный архив** `dsh-rlm-tools-bsl-0.1.1.tgz` (скачан со страницы релизов или собран самому: `cd dsh-rlm-tools-bsl && npm pack`):
 
 ```sh
 dsh plugin --profile web add dsh-rlm-tools-bsl-0.1.0.tgz
@@ -105,14 +107,31 @@ dsh plugin --profile web add <путь к папке>/dsh-rlm-tools-bsl
 Python 3.10+ и [uv](https://github.com/astral-sh/uv):
 
 ```sh
-uv tool install rlm-tools-bsl
+uv tool install rlm-tools-bsl     # установка
+uv tool upgrade rlm-tools-bsl     # обновление уже установленного
+rlm-tools-bsl --version           # нужна версия ≥ 1.35
 ```
 
-Изолированное окружение uv: исполняемый файл — `%USERPROFILE%\.local\bin\rlm-tools-bsl.exe`, служба не регистрируется. Плагин находит файл сам (PATH, затем этот каталог); другой путь задаётся ключом `command` в строке плагина (см. «Продвинутые параметры»).
+Повторный `uv tool install` уже установленный пакет не обновляет (`rlm-tools-bsl is already installed`) — для обновления нужен `uv tool upgrade`.
 
-> Служба Windows (`simple-install-from-pip.ps1`) не требуется. Если она уже установлена, остановите её: `rlm-tools-bsl service stop` (или `net stop <имя службы>`) — иначе она будет держать свой порт.
+Изолированное окружение uv: исполняемый файл — `%USERPROFILE%\.local\bin\rlm-tools-bsl.exe`, служба не регистрируется. Плагин находит файл сам (PATH, затем этот каталог); другой путь задаётся ключом `command` в строке плагина (см. «Продвинутые параметры»). После обновления пакета — **«Перезапустить»** во вкладке.
 
-Обновление: `uv tool upgrade rlm-tools-bsl`, затем **«Перезапустить»** во вкладке.
+> Служба Windows (`simple-install-from-pip.ps1`) не требуется. Если она установлена: `rlm-tools-bsl service status` — состояние, `rlm-tools-bsl service stop` — остановка, `rlm-tools-bsl service uninstall` — удаление. Остановки недостаточно: служба с типом запуска «Автоматически» поднимется при следующей загрузке Windows.
+
+### Данные и файловая песочница
+
+rlm-tools-bsl пишет вне рабочей папки: `service.json` и `projects.json` — в `%USERPROFILE%\.config\rlm-tools-bsl`, лог — в `%USERPROFILE%\.config\rlm-tools-bsl\logs\server.log`, кэш — в `%USERPROFILE%\.cache\rlm-tools-bsl`. Каталог логов должен быть доступен на запись: если запись запрещена (файловая песочница DSH), сервер завершается с кодом 1 и `PermissionError` в хвосте лога.
+
+Перенаправление — переменные окружения в строке плагина: `RLM_CONFIG_FILE` переносит конфиг, лог и кэш рядом с собой, `RLM_INDEX_DIR` — каталог SQLite-индексов.
+
+```yaml
+- id: rlm-tools-bsl
+  name: 'dsh-rlm-tools-bsl'
+  config:
+    env:
+      RLM_CONFIG_FILE: D:\rlm-data\service.json   # лог: D:\rlm-data\logs, кэш: D:\rlm-data\cache
+      RLM_INDEX_DIR: D:\rlm-data\index
+```
 
 ### Если `dsh` не в PATH
 
@@ -138,8 +157,10 @@ node "C:\путь\к\dsh\lib\bin.js" plugin --profile web add "C:\путь\к\ds
 | После установки в `dsh.profile.bundles` появились лишние пакеты | `dsh plugin add` перезаписывает список слоёв: плагины, которые `dshmarket` держал «горячими» (`.dsh-market\hot-*.yml`), получают постоянную активацию. Ненужные строки можно удалить из `package.json` профиля, на работу плагина это не влияет |
 | Вкладки нет после установки | DSH не перезапущен либо страница не перезагружена жёстко (`Ctrl+Shift+R`) |
 | Статус «порт занят» | порт держит другой процесс (например, служба rlm-tools-bsl или чужое приложение) — во вкладке видно имя и pid; остановите его или смените порт |
+| Сервер падает с кодом 1, в логе `PermissionError` на `…\.config\rlm-tools-bsl\logs` | каталог недоступен на запись (файловая песочница DSH): разрешите путь или задайте `RLM_CONFIG_FILE` и `RLM_INDEX_DIR` в переменных окружения плагина — см. «Данные и файловая песочница» |
+| Служба rlm-tools-bsl поднимается сама после перезагрузки | служба установлена с типом запуска «Автоматически»: `rlm-tools-bsl service uninstall`, см. «Установка самого rlm-tools-bsl» |
 
-Проверка, что хост-часть поднялась: `curl -s http://127.0.0.1:<порт>/rlm/state` — должен вернуться JSON с состоянием сервера.
+Проверка, что хост-часть поднялась: `curl -s http://127.0.0.1:<порт>/rlm/state` — должен вернуться JSON с состоянием сервера. `<порт>` — порт веб-UI DSH (по умолчанию 3080, у DSH Desktop может быть другим — он виден в адресной строке браузера), а не порт MCP-сервера.
 
 ## Параметры
 
@@ -157,9 +178,8 @@ node "C:\путь\к\dsh\lib\bin.js" plugin --profile web add "C:\путь\к\ds
   config:
     command: D:\tools\rlm\rlm-tools-bsl.exe      # свой путь к исполняемому файлу
     port: 9330
-    env:                                          # переменные окружения сервера
-      RLM_CONFIG_FILE: D:\tools\rlm\config\service.json
-      RLM_INDEX_DIR: D:\tools\rlm\index
+    env:                                          # переменные окружения сервера, см. «Данные и файловая песочница»
+      RLM_LLM_MODEL: deepseek-chat                # пример: любой ключ RLM_* для самого сервера
     takeover: true                                # гасить вместе с DSH даже подхваченный процесс
 ```
 
