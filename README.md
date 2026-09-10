@@ -104,9 +104,12 @@ dsh plugin --profile web add <путь к папке>/dsh-rlm-tools-bsl
 
 ### Установка самого rlm-tools-bsl
 
-Python 3.10+ и [uv](https://github.com/astral-sh/uv):
+Нужен [uv](https://github.com/astral-sh/uv) — Python 3.10+ uv скачает сам, если его нет в системе:
 
-```sh
+```powershell
+# uv, если его ещё нет (без админ-прав)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
 uv tool install rlm-tools-bsl     # установка
 uv tool upgrade rlm-tools-bsl     # обновление уже установленного
 rlm-tools-bsl --version           # нужна версия ≥ 1.35
@@ -196,7 +199,7 @@ node "C:\путь\к\dsh\lib\bin.js" plugin --profile web add "C:\путь\к\ds
 
 - DeepSeek Harness (`dsh web` или DSH Desktop) ≥ 0.1.2-rc.1 — вкладка использует слот `settings.section`
 - Node.js ≥ 20
-- [rlm-tools-bsl](https://github.com/Dach-Coin/rlm-tools-bsl) ≥ 1.35 (Python 3.10+, ставится через uv) — плагин его не устанавливает
+- [rlm-tools-bsl](https://github.com/Dach-Coin/rlm-tools-bsl) ≥ 1.35 — ставится отдельно (`uv tool install rlm-tools-bsl`), плагин сервер не устанавливает
 
 ## HTTP-роуты
 
