@@ -1,6 +1,6 @@
 // E2E хост-половины без DSH: мок ctx (webServer.register записывается) + реальный http-сервер,
-// поверх — настоящий rlm-tools-bsl. Проверяет запуск, подхват внешнего процесса, перезапуск,
-// остановку и роуты. Настройки и логи пишутся в отдельный DSH_HOME во временном каталоге.
+// поверх — настоящий rlm-tools-bsl. Проверяет автозапуск, подхват внешнего процесса,
+// перезапуск, остановку и роуты. Настройки и логи пишутся в отдельный DSH_HOME во временном каталоге.
 //
 // Запуск: node tests/_http.mjs
 import { spawn, spawnSync } from "node:child_process";
@@ -60,7 +60,7 @@ const ctx = {
 };
 
 const plugin = await import(new URL("../lib/index.js", import.meta.url).href);
-plugin.apply(ctx, { autoStart: false, port: PORT, command });
+plugin.apply(ctx, { port: PORT, command });
 
 const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
@@ -83,34 +83,40 @@ async function api(path, init) {
   return { status: response.status, data };
 }
 
+async function waitState(predicate, timeoutMs = 40000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    last = (await api("/rlm/state")).data;
+    if (last && predicate(last)) return last;
+    await new Promise((done) => setTimeout(done, 500));
+  }
+  return last;
+}
+
 let exitCode = 0;
 try {
-  // ── 1. состояние до запуска ──────────────────────────────────────────────
-  const state0 = await api("/rlm/state");
-  check("GET /rlm/state отвечает ok", state0.status === 200 && state0.data?.ok === true);
-  check("до запуска сервер не работает", state0.data.server.running === false);
-  check("порт свободен", state0.data.server.portOwner === null, JSON.stringify(state0.data.server.portOwner));
-  check("команда определена в конфиге", state0.data.config.command === command, state0.data.config.command);
-  check("порт из конфига строки плагина", state0.data.config.port === PORT);
-  check("сниппет MCP содержит URL", state0.data.mcp.snippet.includes(`http://127.0.0.1:${PORT}/mcp`));
-
-  // ── 2. запуск ────────────────────────────────────────────────────────────
-  const started = await api("/rlm/start", { method: "POST" });
-  check("POST /rlm/start запускает сервер", started.data?.server?.running === true && started.data.server.managed === true);
-  check("pid получен", Number.isInteger(started.data.server.pid) && started.data.server.pid > 0, String(started.data.server.pid));
-  check("версия прочитана из MCP initialize", /^\d+\.\d+/.test(String(started.data.server.version)), String(started.data.server.version));
+  // ── 1. автозапуск при apply ──────────────────────────────────────────────
+  // running появляется сразу после спавна; version — когда сервер ответил на initialize.
+  const started = await waitState((state) => state.server.running && state.server.version);
+  check("сервер стартует сам при загрузке плагина (apply)", started?.server?.running === true && started.server.managed === true, JSON.stringify(started?.server?.lastError ?? null));
+  check("pid получен", Number.isInteger(started?.server?.pid) && started.server.pid > 0, String(started?.server?.pid));
+  check("версия прочитана из MCP initialize", /^\d+\.\d+/.test(String(started?.server?.version)), String(started?.server?.version));
   check("health сервера отвечает", await reachable(`http://127.0.0.1:${PORT}/health`));
+  check("команда определена", started?.config?.command === command, String(started?.config?.command));
+  check("порт из строки плагина", started?.config?.port === PORT);
+  check("сниппет MCP содержит URL", started?.mcp?.snippet?.includes(`http://127.0.0.1:${PORT}/mcp`));
 
-  // повторный start идемпотентен
+  // ── 2. повторный start идемпотентен ──────────────────────────────────────
   const again = await api("/rlm/start", { method: "POST" });
-  check("повторный start не поднимает второй процесс", again.data.server.managed === true && again.data.server.pid === started.data.server.pid);
+  check("повторный start не поднимает второй процесс", again.data?.server?.managed === true && again.data.server.pid === started.server.pid);
 
   // ── 3. лог и настройки ───────────────────────────────────────────────────
   const log = await api("/rlm/log?tail=50");
   check("GET /rlm/log отдаёт строки", log.status === 200 && Array.isArray(log.data.lines) && log.data.lines.length > 0, "строк: " + (log.data?.lines?.length ?? 0));
   check("в логе есть заголовок запуска", (log.data.lines || []).some((line) => line.includes("запуск:")));
 
-  const saved = await api("/rlm/save", { method: "POST", body: JSON.stringify({ settings: { port: PORT, host: "127.0.0.1", autoStart: false } }) });
+  const saved = await api("/rlm/save", { method: "POST", body: JSON.stringify({ settings: { port: PORT } }) });
   check("POST /rlm/save сохраняет без перезапуска", saved.status === 200 && saved.data.needsRestart === false);
   const settingsFile = join(DSH_HOME, "rlm-tools-bsl", "settings.json");
   check("settings.json записан", existsSync(settingsFile) && JSON.parse(readFileSync(settingsFile, "utf-8")).port === PORT, settingsFile);
@@ -121,7 +127,7 @@ try {
   // ── 4. перезапуск ────────────────────────────────────────────────────────
   const restarted = await api("/rlm/restart", { method: "POST" });
   check("POST /rlm/restart поднимает сервер заново", restarted.data?.server?.running === true);
-  check("pid после перезапуска другой", restarted.data.server.pid !== started.data.server.pid, `${started.data.server.pid} → ${restarted.data.server.pid}`);
+  check("pid после перезапуска другой", restarted.data.server.pid !== started.server.pid, `${started.server.pid} → ${restarted.data.server.pid}`);
 
   // ── 5. остановка ─────────────────────────────────────────────────────────
   const stopped = await api("/rlm/stop", { method: "POST" });

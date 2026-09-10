@@ -1,9 +1,8 @@
 // dsh-rlm-tools-bsl — хост-половина плагина.
 //
-// Владеет жизненным циклом сервера rlm-tools-bsl (MCP для анализа кода 1С по HTTP):
-// поднимает его при старте DSH, гасит вместе с DSH и отдаёт состояние вкладке настроек.
-//   $DSH_HOME/rlm-tools-bsl/settings.json       — настройки запуска
-//   $DSH_HOME/rlm-tools-bsl/logs/server.out.log — stdout/stderr запущенного процесса
+// Раннер: поднимает сервер rlm-tools-bsl (MCP для анализа кода 1С по HTTP) при старте DSH
+// и гасит его вместе с DSH. Настройки — $DSH_HOME/rlm-tools-bsl/settings.json,
+// stdout сервера — $DSH_HOME/rlm-tools-bsl/logs/server.out.log.
 // Все роуты живут под префиксом /rlm и отдают JSON.
 import { closeSync, existsSync, mkdirSync, openSync, readSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
@@ -18,6 +17,7 @@ export const inject = ["webServer"];
 const ROUTE = "/rlm";
 const SERVER_NAME = "rlm-tools-bsl";
 const MCP_SERVER_NAME = "rlm";
+const HOST = "127.0.0.1";
 const SCHEMA = "dsh-rlm-tools-bsl/v1";
 const DEFAULT_PORT = 9330;
 const START_TIMEOUT_MS = 30_000;
@@ -26,14 +26,11 @@ const PROBE_TIMEOUT_MS = 2_000;
 const LOG_ROTATE_BYTES = 2 * 1024 * 1024;
 const TAIL_BYTES = 64 * 1024;
 
+// Дополнительные ключи (command, env, takeover) задаются только строкой плагина в cordis.patch.yml.
 const DEFAULTS = {
   command: "",
   port: DEFAULT_PORT,
-  host: "127.0.0.1",
-  extraArgs: [],
-  cwd: "",
   env: {},
-  autoStart: true,
   takeover: true,
 };
 const FIELD_KEYS = Object.keys(DEFAULTS);
@@ -164,7 +161,7 @@ function detectCommand() {
   return value;
 }
 
-// Приоритет: значения вкладки → значения строки плагина в cordis.patch.yml → встроенные.
+// Приоритет: значения из settings.json → значения строки плагина в cordis.patch.yml → встроенные.
 function effectiveConfig(rt) {
   const sources = {};
   const out = {};
@@ -183,31 +180,33 @@ function effectiveConfig(rt) {
     }
   }
   out.port = Number(out.port) || DEFAULT_PORT;
-  out.host = String(out.host || DEFAULTS.host);
-  out.extraArgs = Array.isArray(out.extraArgs) ? out.extraArgs.map(String) : [];
   out.env = out.env && typeof out.env === "object" && !Array.isArray(out.env) ? out.env : {};
-  out.autoStart = out.autoStart !== false;
   out.takeover = out.takeover !== false;
-  const detected = detectCommand();
-  const commandSet = isSet(out.command);
-  if (!commandSet && detected) {
-    out.command = detected;
-    sources.command = "detected";
+  if (!isSet(out.command)) {
+    const detected = detectCommand();
+    if (detected) {
+      out.command = detected;
+      sources.command = "detected";
+    }
   }
-  return { config: out, sources, detected, commandSet };
+  return { config: out, sources, detected: detectCommand() };
 }
 
 function launchArgs(cfg) {
-  return ["--transport", "streamable-http", "--host", String(cfg.host), "--port", String(cfg.port), ...cfg.extraArgs];
+  return ["--transport", "streamable-http", "--host", HOST, "--port", String(cfg.port)];
 }
 
 // ── внешние процессы ───────────────────────────────────────────────────────
 
 // Чужой процесс, слушающий порт: PID по netstat и имя по tasklist.
-function portOwner(port) {
+// Кэш — только для частых опросов состояния из UI; в путях запуска и остановки
+// нужна свежая проверка (fresh), иначе перезапуск ловит устаревшее «порт свободен».
+function portOwner(port, fresh = false) {
   const now = Date.now();
-  const cached = portOwnerCache.get(port);
-  if (cached && now - cached.at < 2000) return cached.value;
+  if (!fresh) {
+    const cached = portOwnerCache.get(port);
+    if (cached && now - cached.at < 2000) return cached.value;
+  }
   const value = portOwnerUncached(port);
   portOwnerCache.set(port, { at: now, value });
   return value;
@@ -220,8 +219,7 @@ function portOwnerUncached(port) {
     for (const line of String(net.stdout ?? "").split(/\r?\n/)) {
       if (!/LISTENING/i.test(line)) continue;
       const parts = line.trim().split(/\s+/);
-      const local = parts[1] ?? "";
-      if (!local.endsWith(":" + port)) continue;
+      if (!(parts[1] ?? "").endsWith(":" + port)) continue;
       const candidate = Number(parts[parts.length - 1]);
       if (Number.isInteger(candidate) && candidate > 0) pid = candidate;
     }
@@ -275,13 +273,11 @@ function rlmProcessTop(pid) {
     const list = Array.isArray(parsed) ? parsed : [parsed];
     const byPid = new Map(list.map((proc) => [Number(proc.ProcessId), proc]));
     let current = Number(pid);
-    const chain = [current];
     for (let guard = 0; guard < 16; guard += 1) {
       const parentId = Number(byPid.get(current)?.ParentProcessId);
       const parent = byPid.get(parentId);
       if (!parent || !isRlmProcess(parent)) break;
       current = parentId;
-      chain.push(current);
     }
     return current;
   } catch {
@@ -304,9 +300,9 @@ function sseJson(text) {
 }
 
 // Личность сервера: /health отдаёт generic {"status":"ok"}, имя и версию знает только MCP initialize.
-async function probeIdentity(host, port, timeoutMs = PROBE_TIMEOUT_MS) {
+async function probeIdentity(port, timeoutMs = PROBE_TIMEOUT_MS) {
   try {
-    const response = await fetch(`http://${host}:${port}/mcp`, {
+    const response = await fetch(`http://${HOST}:${port}/mcp`, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
       body: JSON.stringify({
@@ -330,10 +326,10 @@ async function probeIdentity(host, port, timeoutMs = PROBE_TIMEOUT_MS) {
 async function waitPortFree(port, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!portOwner(port)) return true;
+    if (!portOwner(port, true)) return true;
     await sleep(250);
   }
-  return !portOwner(port);
+  return !portOwner(port, true);
 }
 
 // ── состояние плагина ──────────────────────────────────────────────────────
@@ -352,7 +348,6 @@ function createRuntime(ctx, config) {
     stopping: false,
     lastError: null,
     lastExit: null,
-    lastLogHeader: null,
   };
 }
 
@@ -365,17 +360,15 @@ function logInfo(rt, message) {
 }
 
 function snapshot(rt) {
-  const { config, sources, detected, commandSet } = effectiveConfig(rt);
+  const { config, sources, detected } = effectiveConfig(rt);
   const running = Boolean(rt.child) || Boolean(rt.adopted);
-  const owner = running ? null : portOwner(config.port);
-  const url = `http://${config.host}:${config.port}/mcp`;
+  const url = `http://${HOST}:${config.port}/mcp`;
   const snippet = JSON.stringify({ serverName: MCP_SERVER_NAME, transport: "streamable-http", url, enabled: true }, null, 2);
   return {
     ok: true,
     server: {
       name: SERVER_NAME,
       url,
-      healthUrl: `http://${config.host}:${config.port}/health`,
       running,
       starting: rt.starting,
       stopping: rt.stopping,
@@ -386,10 +379,9 @@ function snapshot(rt) {
       startedAt: rt.startedAt,
       uptimeMs: rt.startedAt ? Date.now() - rt.startedAt : null,
       lastError: rt.lastError,
-      lastExit: rt.lastExit,
-      portOwner: owner,
+      portOwner: running ? null : portOwner(config.port),
     },
-    config: { ...config, sources, detected, commandSet },
+    config: { command: config.command, port: config.port, env: config.env, takeover: config.takeover, detected, sources },
     mcp: { serverName: MCP_SERVER_NAME, transport: "streamable-http", url, enabled: true, snippet },
     paths: { dir: DIR, settings: SETTINGS_FILE, log: LOG_FILE, dshHome: DSH_HOME },
     logTail: tailLines(LOG_FILE, 30),
@@ -407,11 +399,11 @@ async function startServer(rt) {
   try {
     const { config } = effectiveConfig(rt);
 
-    const existing = await probeIdentity(config.host, config.port, 1500);
+    const existing = await probeIdentity(config.port, 1500);
     if (existing.ok) {
-      // Сервер уже поднят (например, остался от прошлой сессии) — не запускаем второй.
-      const owner = portOwner(config.port);
-      rt.adopted = { pid: rlmProcessTop(owner?.pid), listener: owner?.pid ?? null, image: owner?.image ?? null };
+      // Сервер уже поднят (остался от прошлой сессии) — второй не запускаем.
+      const owner = portOwner(config.port, true);
+      rt.adopted = { pid: rlmProcessTop(owner?.pid), listener: owner?.pid ?? null };
       rt.version = existing.version;
       rt.startedAt = Date.now();
       logInfo(rt, `сервер уже работает (pid ${rt.adopted.pid ?? "?"}), подключаюсь как внешний`);
@@ -422,7 +414,7 @@ async function startServer(rt) {
       return snapshot(rt);
     }
     if (!config.command) {
-      rt.lastError = `не найдена команда ${SERVER_NAME}: укажите путь к исполняемому файлу в настройках вкладки`;
+      rt.lastError = `не найдена команда ${SERVER_NAME}: установите пакет (uv tool install ${SERVER_NAME}) или задайте путь ключом command в строке плагина`;
       return snapshot(rt);
     }
 
@@ -437,7 +429,7 @@ async function startServer(rt) {
     try {
       writeFileSync(LOG_FILE, header, { encoding: "utf8", flag: "a" });
       const child = spawn(config.command, launchArgs(config), {
-        cwd: isSet(config.cwd) && existsSync(config.cwd) ? config.cwd : DIR,
+        cwd: DIR,
         env: { ...process.env, ...config.env },
         stdio: ["ignore", handle, handle],
         windowsHide: true,
@@ -446,7 +438,6 @@ async function startServer(rt) {
       rt.child = child;
       rt.childPid = child.pid ?? null;
       rt.startedAt = Date.now();
-      rt.lastLogHeader = header.trim();
       child.on("exit", (code, signal) => {
         if (rt.child !== child) return;
         rt.child = null;
@@ -468,16 +459,16 @@ async function startServer(rt) {
       if (!rt.child) break;
       // spawn не удался (нет файла/прав): pid нет, ждать 30 секунд незачем
       if (!rt.childPid && rt.lastError) break;
-      const probe = await probeIdentity(config.host, config.port, 1500);
+      const probe = await probeIdentity(config.port, 1500);
       if (probe.ok) {
         rt.version = probe.version;
-        logInfo(rt, `сервер поднят на ${config.host}:${config.port} (v${probe.version ?? "?"})`);
+        logInfo(rt, `сервер поднят на ${HOST}:${config.port} (v${probe.version ?? "?"})`);
         break;
       }
       await sleep(400);
     }
     if (rt.child && !rt.version && !rt.lastError) {
-      const owner = portOwner(config.port);
+      const owner = portOwner(config.port, true);
       rt.lastError = owner && owner.pid !== rt.childPid
         ? `порт ${config.port} занят процессом ${owner.image ?? "?"} (pid ${owner.pid})`
         : `сервер не ответил за ${Math.round(START_TIMEOUT_MS / 1000)} с; хвост лога — ниже`;
@@ -506,8 +497,7 @@ async function stopServer(rt) {
     rt.adopted = null;
     rt.version = null;
     rt.startedAt = null;
-    if (!freed) rt.lastError = `порт ${config.port} всё ещё занят после остановки`;
-    else rt.lastError = null;
+    rt.lastError = freed ? null : `порт ${config.port} всё ещё занят после остановки`;
     return snapshot(rt);
   } finally {
     rt.stopping = false;
@@ -520,21 +510,13 @@ async function restartServer(rt) {
   await waitPortFree(config.port, STOP_TIMEOUT_MS);
   return startServer(rt);
 }
-
 function saveSettings(rt, patch) {
   const next = { ...rt.settings };
-  if (typeof patch?.command === "string") next.command = patch.command.trim();
   if (patch?.port !== undefined) {
     const port = Number(patch.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("порт должен быть целым числом 1..65535");
     next.port = port;
   }
-  if (typeof patch?.host === "string" && patch.host.trim()) next.host = patch.host.trim();
-  if (Array.isArray(patch?.extraArgs)) next.extraArgs = patch.extraArgs.map(String).filter((value) => value.trim());
-  if (typeof patch?.cwd === "string") next.cwd = patch.cwd.trim();
-  if (patch?.env && typeof patch.env === "object" && !Array.isArray(patch.env)) next.env = patch.env;
-  if (typeof patch?.autoStart === "boolean") next.autoStart = patch.autoStart;
-  if (typeof patch?.takeover === "boolean") next.takeover = patch.takeover;
   next.$schema = SCHEMA;
   writeJson(SETTINGS_FILE, next);
   rt.settings = readSettings();
@@ -552,12 +534,11 @@ export function apply(ctx, config) {
     ctx.on("dispose", () => stopServer(rt));
   }
 
-  // Аварийный путь: спавн синхронно, обычное завершение процесса DSH.
-  const emergency = () => {
+  // Аварийный путь: синхронное убийство при обычном завершении процесса DSH.
+  process.once("exit", () => {
     const known = rt.childPid ?? rt.adopted?.pid ?? null;
     if (known) killTree(known);
-  };
-  process.once("exit", emergency);
+  });
 
   ctx.webServer.register({
     kind: "exact",
@@ -565,19 +546,6 @@ export function apply(ctx, config) {
     handler: (_req, res) => {
       try {
         json(res, 200, snapshot(rt));
-      } catch (error) {
-        json(res, 500, { ok: false, error: error?.message || String(error) });
-      }
-    },
-  });
-
-  ctx.webServer.register({
-    kind: "exact",
-    path: ROUTE + "/detect",
-    handler: (_req, res) => {
-      try {
-        const detected = detectCommand();
-        json(res, 200, { ok: true, detected, exists: detected ? existsSync(detected) : false });
       } catch (error) {
         json(res, 500, { ok: false, error: error?.message || String(error) });
       }
@@ -639,43 +607,17 @@ export function apply(ctx, config) {
     handler: async (req, res) => {
       try {
         const body = JSON.parse((await readBody(req)) || "{}");
-        const before = effectiveConfig(rt).config;
+        const before = effectiveConfig(rt).config.port;
         saveSettings(rt, body?.settings ?? {});
-        const after = effectiveConfig(rt).config;
-        const restartKeys = ["command", "port", "host", "extraArgs", "cwd", "env"];
-        const needsRestart = restartKeys.some((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key]));
-        json(res, 200, { ...snapshot(rt), needsRestart: needsRestart && Boolean(rt.child || rt.adopted) });
+        const after = effectiveConfig(rt).config.port;
+        json(res, 200, { ...snapshot(rt), needsRestart: before !== after && Boolean(rt.child || rt.adopted) });
       } catch (error) {
         json(res, 400, { ok: false, error: error?.message || String(error) });
       }
     },
   });
 
-  // Забрать порт у чужого процесса: только по явному действию из вкладки.
-  ctx.webServer.register({
-    kind: "exact",
-    path: ROUTE + "/free-port",
-    handler: async (req, res) => {
-      try {
-        const body = JSON.parse((await readBody(req)) || "{}");
-        const { config } = effectiveConfig(rt);
-        const owner = portOwner(config.port);
-        if (!owner) return json(res, 200, { ok: true, freed: false, reason: "порт свободен" });
-        if (Number(body?.pid) && Number(body.pid) !== owner.pid) {
-          return json(res, 400, { ok: false, error: `порт ${config.port} держит pid ${owner.pid}, а не ${body.pid}` });
-        }
-        killTree(rlmProcessTop(owner.pid));
-        const freed = await waitPortFree(config.port, STOP_TIMEOUT_MS);
-        json(res, freed ? 200 : 500, freed ? { ok: true, freed: true, pid: owner.pid, image: owner.image } : { ok: false, error: "порт всё ещё занят" });
-      } catch (error) {
-        json(res, 500, { ok: false, error: error?.message || String(error) });
-      }
-    },
+  startServer(rt).catch((error) => {
+    rt.lastError = "автозапуск не удался: " + (error?.message || String(error));
   });
-
-  if (effectiveConfig(rt).config.autoStart) {
-    startServer(rt).catch((error) => {
-      rt.lastError = "автозапуск не удался: " + (error?.message || String(error));
-    });
-  }
 }
