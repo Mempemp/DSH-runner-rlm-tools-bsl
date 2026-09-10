@@ -98,6 +98,7 @@ window.__ModuleLoader__.load({
     };
 
     function badge(server) {
+      if (server.installing) return { dot: "◌", color: "#e0a030", text: "устанавливается rlm-tools-bsl…" };
       if (server.starting) return { dot: "◌", color: "#e0a030", text: "запускается…" };
       if (server.stopping) return { dot: "◌", color: "#e0a030", text: "останавливается…" };
       if (server.managed) return { dot: "●", color: "#4caf50", text: "работает (pid " + server.pid + (server.version ? ", v" + server.version : "") + ")" };

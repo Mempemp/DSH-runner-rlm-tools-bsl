@@ -18,7 +18,7 @@ const ROUTE = "/rlm";
 const SERVER_NAME = "rlm-tools-bsl";
 const MCP_SERVER_NAME = "rlm";
 const HOST = "127.0.0.1";
-const PLUGIN_VERSION = "0.1.1";
+const PLUGIN_VERSION = "0.1.2";
 const SCHEMA = "dsh-rlm-tools-bsl/v1";
 const DEFAULT_PORT = 9330;
 const START_TIMEOUT_MS = 30_000;
@@ -26,13 +26,16 @@ const STOP_TIMEOUT_MS = 8_000;
 const PROBE_TIMEOUT_MS = 2_000;
 const LOG_ROTATE_BYTES = 2 * 1024 * 1024;
 const TAIL_BYTES = 64 * 1024;
+const INSTALL_TIMEOUT_MS = 15 * 60_000;
+const UV_INSTALL_SCRIPT = "irm https://astral.sh/uv/install.ps1 | iex";
 
-// Дополнительные ключи (command, env, takeover) задаются только строкой плагина в cordis.patch.yml.
+// Дополнительные ключи (command, env, takeover, autoInstall) задаются только строкой плагина в cordis.patch.yml.
 const DEFAULTS = {
   command: "",
   port: DEFAULT_PORT,
   env: {},
   takeover: true,
+  autoInstall: true,
 };
 const FIELD_KEYS = Object.keys(DEFAULTS);
 
@@ -47,6 +50,10 @@ const DSH_HOME = (() => {
 const DIR = join(DSH_HOME, SERVER_NAME);
 const SETTINGS_FILE = join(DIR, "settings.json");
 const LOG_FILE = join(DIR, "logs", "server.out.log");
+// Автоустановка: окружение инструмента, его исполняемые файлы и Python — внутри папки плагина.
+const TOOL_DIR = join(DIR, "tool");
+const TOOL_BIN_DIR = join(DIR, "bin");
+const PYTHON_DIR = join(DIR, "python");
 
 // ── утилиты ────────────────────────────────────────────────────────────────
 
@@ -153,9 +160,9 @@ function pickConfig(config) {
   return out;
 }
 
-function detectCommand() {
+function detectCommand(fresh = false) {
   const now = Date.now();
-  if (detectedCache && now - detectedCache.at < 15000) return detectedCache.value;
+  if (!fresh && detectedCache && now - detectedCache.at < 15000) return detectedCache.value;
   const probe = process.platform === "win32" ? "where" : "which";
   const found = spawnSync(probe, [SERVER_NAME], { encoding: "utf8", windowsHide: true, timeout: 5000 });
   let value = "";
@@ -163,15 +170,36 @@ function detectCommand() {
     value = String(found.stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || "";
   }
   if (!value) {
-    const portable = join(homedir(), ".local", "bin", process.platform === "win32" ? SERVER_NAME + ".exe" : SERVER_NAME);
-    if (existsSync(portable)) value = portable;
+    const exe = process.platform === "win32" ? SERVER_NAME + ".exe" : SERVER_NAME;
+    for (const dir of [join(homedir(), ".local", "bin"), TOOL_BIN_DIR]) {
+      const candidate = join(dir, exe);
+      if (existsSync(candidate)) {
+        value = candidate;
+        break;
+      }
+    }
   }
   detectedCache = { at: now, value };
   return value;
 }
 
+// uv ищется в PATH, затем в %USERPROFILE%\.local\bin и в bin самого плагина (куда его кладёт автоустановка).
+function detectUv() {
+  const probe = process.platform === "win32" ? "where" : "which";
+  const found = spawnSync(probe, ["uv"], { encoding: "utf8", windowsHide: true, timeout: 5000 });
+  if (found.status === 0) {
+    const first = String(found.stdout ?? "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0];
+    if (first) return first;
+  }
+  const exe = process.platform === "win32" ? "uv.exe" : "uv";
+  for (const candidate of [join(homedir(), ".local", "bin", exe), join(TOOL_BIN_DIR, exe)]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "";
+}
+
 // Приоритет: значения из settings.json → значения строки плагина в cordis.patch.yml → встроенные.
-function effectiveConfig(rt) {
+function effectiveConfig(rt, fresh = false) {
   const sources = {};
   const out = {};
   for (const key of FIELD_KEYS) {
@@ -191,14 +219,15 @@ function effectiveConfig(rt) {
   out.port = Number(out.port) || DEFAULT_PORT;
   out.env = out.env && typeof out.env === "object" && !Array.isArray(out.env) ? out.env : {};
   out.takeover = out.takeover !== false;
+  out.autoInstall = out.autoInstall !== false;
   if (!isSet(out.command)) {
-    const detected = detectCommand();
+    const detected = detectCommand(fresh);
     if (detected) {
       out.command = detected;
       sources.command = "detected";
     }
   }
-  return { config: out, sources, detected: detectCommand() };
+  return { config: out, sources, detected: detectCommand(fresh) };
 }
 
 function launchArgs(cfg) {
@@ -355,6 +384,7 @@ function createRuntime(ctx, config) {
     startedAt: null,
     starting: false,
     stopping: false,
+    installing: false,
     lastError: null,
     lastExit: null,
   };
@@ -381,6 +411,7 @@ function snapshot(rt) {
       running,
       starting: rt.starting,
       stopping: rt.stopping,
+      installing: rt.installing,
       managed: Boolean(rt.child),
       adopted: Boolean(rt.adopted),
       pid: rt.childPid ?? rt.adopted?.pid ?? null,
@@ -399,6 +430,93 @@ function snapshot(rt) {
 
 // ── жизненный цикл сервера ─────────────────────────────────────────────────
 
+// Запуск внешней команды с выводом в лог: цикл событий не блокируем, установка идёт минутами.
+function runToLog(command, args, options = {}) {
+  return new Promise((done) => {
+    let output = "";
+    try {
+      writeFileSync(LOG_FILE, `\n===== ${new Date().toISOString()} ${command} ${args.join(" ")}\n`, { encoding: "utf8", flag: "a" });
+    } catch {
+      // лог недоступен — не повод не запускать
+    }
+    const child = spawn(command, args, { env: options.env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const collect = (chunk) => {
+      output += chunk.toString("utf8");
+    };
+    const finish = (code) => {
+      try {
+        writeFileSync(LOG_FILE, output, { encoding: "utf8", flag: "a" });
+      } catch {
+        // см. выше
+      }
+      done({ code, output });
+    };
+    const timer = setTimeout(() => {
+      output += "\n[таймаут выполнения команды]\n";
+      try {
+        child.kill();
+      } catch {
+        // уже мёртв
+      }
+    }, INSTALL_TIMEOUT_MS);
+    child.stdout?.on("data", collect);
+    child.stderr?.on("data", collect);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      output += "\n" + (error?.message || String(error));
+      finish(-1);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      finish(code ?? -1);
+    });
+  });
+}
+
+// Автоустановка rlm-tools-bsl в папку плагина: uv берётся из PATH, при отсутствии — ставится
+// официальным скриптом внутрь bin/, затем инструмент ставится с каталогами внутри DIR.
+async function autoInstall(rt) {
+  rt.installing = true;
+  try {
+    mkdirSync(DIR, { recursive: true });
+    let uv = detectUv();
+    if (!uv) {
+      logInfo(rt, "uv не найден — ставлю его в " + TOOL_BIN_DIR);
+      const boot = await runToLog("powershell", ["-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", UV_INSTALL_SCRIPT], {
+        env: { ...process.env, UV_INSTALL_DIR: TOOL_BIN_DIR, UV_NO_MODIFY_PATH: "1", UV_DISABLE_UPDATE: "1" },
+      });
+      if (boot.code !== 0) {
+        rt.lastError = `uv не найден, а установить его не удалось (код ${boot.code}); вывод — в хвосте лога. Поставьте uv вручную: powershell -ExecutionPolicy ByPass -c "${UV_INSTALL_SCRIPT}"`;
+        return "";
+      }
+      uv = detectUv();
+    }
+    if (!uv) {
+      rt.lastError = "uv не найден и после установки; укажите его в PATH или поставьте вручную";
+      return "";
+    }
+    logInfo(rt, `устанавливаю ${SERVER_NAME} через uv в ${DIR}`);
+    const result = await runToLog(uv, ["tool", "install", SERVER_NAME], {
+      env: {
+        ...process.env,
+        UV_TOOL_DIR: TOOL_DIR,
+        UV_TOOL_BIN_DIR: TOOL_BIN_DIR,
+        UV_PYTHON_INSTALL_DIR: PYTHON_DIR,
+        UV_NO_MODIFY_PATH: "1",
+      },
+    });
+    if (result.code !== 0) {
+      rt.lastError = `установка ${SERVER_NAME} не удалась (код ${result.code}); вывод — в хвосте лога (если включена файловая песочница DSH — разрешите запись в ${DIR})`;
+      return "";
+    }
+    const installed = detectCommand(true);
+    if (!installed) rt.lastError = `установка прошла, но исполняемый файл не найден в ${TOOL_BIN_DIR}`;
+    return installed;
+  } finally {
+    rt.installing = false;
+  }
+}
+
 async function startServer(rt) {
   if (rt.child || rt.adopted || rt.starting) return snapshot(rt);
   rt.starting = true;
@@ -406,7 +524,7 @@ async function startServer(rt) {
   rt.lastExit = null;
   rt.version = null;
   try {
-    const { config } = effectiveConfig(rt);
+    const { config } = effectiveConfig(rt, true);
 
     const existing = await probeIdentity(config.port, 1500);
     if (existing.ok) {
@@ -421,6 +539,12 @@ async function startServer(rt) {
     if (existing.serverName) {
       rt.lastError = `порт ${config.port} занят другим MCP-сервером: ${existing.serverName}`;
       return snapshot(rt);
+    }
+    if (!config.command && config.autoInstall) {
+      const installed = await autoInstall(rt);
+      if (!installed) return snapshot(rt);
+      config.command = installed;
+      logInfo(rt, `установлен ${SERVER_NAME}: ${installed}`);
     }
     if (!config.command) {
       rt.lastError = `не найдена команда ${SERVER_NAME}: установите пакет (uv tool install ${SERVER_NAME}) или задайте путь ключом command в строке плагина`;
