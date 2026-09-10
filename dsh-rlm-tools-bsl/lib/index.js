@@ -4,7 +4,7 @@
 // и гасит его вместе с DSH. Настройки — $DSH_HOME/rlm-tools-bsl/settings.json,
 // stdout сервера — $DSH_HOME/rlm-tools-bsl/logs/server.out.log.
 // Все роуты живут под префиксом /rlm и отдают JSON.
-import { closeSync, existsSync, mkdirSync, openSync, readSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -18,7 +18,7 @@ const ROUTE = "/rlm";
 const SERVER_NAME = "rlm-tools-bsl";
 const MCP_SERVER_NAME = "rlm";
 const HOST = "127.0.0.1";
-const PLUGIN_VERSION = "0.1.2";
+const PLUGIN_VERSION = "0.1.3";
 const SCHEMA = "dsh-rlm-tools-bsl/v1";
 const DEFAULT_PORT = 9330;
 const START_TIMEOUT_MS = 30_000;
@@ -36,6 +36,7 @@ const DEFAULTS = {
   env: {},
   takeover: true,
   autoInstall: true,
+  mcpAutoRegister: true,
 };
 const FIELD_KEYS = Object.keys(DEFAULTS);
 
@@ -54,6 +55,13 @@ const LOG_FILE = join(DIR, "logs", "server.out.log");
 const TOOL_DIR = join(DIR, "tool");
 const TOOL_BIN_DIR = join(DIR, "bin");
 const PYTHON_DIR = join(DIR, "python");
+
+// Известные менеджеры MCP и их хранилища: файл и поле с именем сервера.
+const PROFILES_DIR = join(DSH_HOME, "profiles");
+const MANAGER_STORES = [
+  { manager: "dsh-mcp-manager", pkg: "dsh-mcp-manager", file: join(DSH_HOME, "mcp-servers.json"), nameField: "serverName" },
+  { manager: "@wingsky-1/dsh-mcp-manager", pkg: "@wingsky-1/dsh-mcp-manager", file: join(DSH_HOME, "dsh-mcp.json"), nameField: "name" },
+];
 
 // ── утилиты ────────────────────────────────────────────────────────────────
 
@@ -220,6 +228,7 @@ function effectiveConfig(rt, fresh = false) {
   out.env = out.env && typeof out.env === "object" && !Array.isArray(out.env) ? out.env : {};
   out.takeover = out.takeover !== false;
   out.autoInstall = out.autoInstall !== false;
+  out.mcpAutoRegister = out.mcpAutoRegister !== false;
   if (!isSet(out.command)) {
     const detected = detectCommand(fresh);
     if (detected) {
@@ -232,6 +241,64 @@ function effectiveConfig(rt, fresh = false) {
 
 function launchArgs(cfg) {
   return ["--transport", "streamable-http", "--host", HOST, "--port", String(cfg.port)];
+}
+
+// ── менеджеры MCP ──────────────────────────────────────────────────────────
+
+// Менеджер установлен хотя бы в одном профиле?
+function managerInstalled(pkg) {
+  const candidates = [join(PROFILES_DIR, "node_modules", pkg)];
+  try {
+    for (const entry of readdirSync(PROFILES_DIR, { withFileTypes: true })) {
+      if (entry.isDirectory()) candidates.push(join(PROFILES_DIR, entry.name, "node_modules", pkg));
+    }
+  } catch {
+    // профилей ещё нет
+  }
+  return candidates.some((dir) => existsSync(dir));
+}
+
+function storeEntry(target, url) {
+  const entry = { transport: "streamable-http", url, enabled: true };
+  entry[target.nameField] = MCP_SERVER_NAME;
+  return entry;
+}
+
+// Прописывает сервер в хранилища менеджеров MCP: существующий файл либо файл менеджера,
+// найденного в профилях. Запись с нашим именем обновляется, остальные не трогаются.
+function registerInManagers(url) {
+  const results = [];
+  for (const target of MANAGER_STORES) {
+    try {
+      const exists = existsSync(target.file);
+      if (!exists && !managerInstalled(target.pkg)) {
+        results.push({ manager: target.manager, file: target.file, skipped: true });
+        continue;
+      }
+      const parsed = exists ? readJson(target.file) : null;
+      if (exists && (!parsed || !Array.isArray(parsed.servers))) {
+        results.push({ manager: target.manager, file: target.file, error: "файл не разобран как { version, servers }" });
+        continue;
+      }
+      const data = parsed ?? { version: 1, servers: [] };
+      if (!Array.isArray(data.servers)) data.servers = [];
+      if (!data.version) data.version = 1;
+      const entry = storeEntry(target, url);
+      const index = data.servers.findIndex((item) => item && item[target.nameField] === MCP_SERVER_NAME);
+      const next = index >= 0 ? { ...data.servers[index], ...entry } : entry;
+      if (index >= 0 && JSON.stringify(next) === JSON.stringify(data.servers[index])) {
+        results.push({ manager: target.manager, file: target.file, action: "unchanged" });
+        continue;
+      }
+      if (index >= 0) data.servers[index] = next;
+      else data.servers.push(next);
+      writeJson(target.file, data);
+      results.push({ manager: target.manager, file: target.file, action: index >= 0 ? "updated" : "added" });
+    } catch (error) {
+      results.push({ manager: target.manager, file: target.file, error: error?.message || String(error) });
+    }
+  }
+  return results;
 }
 
 // ── внешние процессы ───────────────────────────────────────────────────────
@@ -385,6 +452,7 @@ function createRuntime(ctx, config) {
     starting: false,
     stopping: false,
     installing: false,
+    mcpRegistration: [],
     lastError: null,
     lastExit: null,
   };
@@ -422,7 +490,7 @@ function snapshot(rt) {
       portOwner: running ? null : portOwner(config.port),
     },
     config: { command: config.command, port: config.port, env: config.env, takeover: config.takeover, detected, sources },
-    mcp: { serverName: MCP_SERVER_NAME, transport: "streamable-http", url, enabled: true, snippet },
+    mcp: { serverName: MCP_SERVER_NAME, transport: "streamable-http", url, enabled: true, snippet, registration: rt.mcpRegistration },
     paths: { dir: DIR, settings: SETTINGS_FILE, log: LOG_FILE, dshHome: DSH_HOME },
     logTail: tailLines(LOG_FILE, 30),
   };
@@ -533,6 +601,7 @@ async function startServer(rt) {
       rt.adopted = { pid: rlmProcessTop(owner?.pid), listener: owner?.pid ?? null };
       rt.version = existing.version;
       rt.startedAt = Date.now();
+      if (config.mcpAutoRegister) rt.mcpRegistration = registerInManagers(`http://${HOST}:${config.port}/mcp`);
       logInfo(rt, `сервер уже работает (pid ${rt.adopted.pid ?? "?"}), подключаюсь как внешний`);
       return snapshot(rt);
     }
@@ -606,6 +675,11 @@ async function startServer(rt) {
         break;
       }
       await sleep(400);
+    }
+    if (rt.version && config.mcpAutoRegister) {
+      rt.mcpRegistration = registerInManagers(`http://${HOST}:${config.port}/mcp`);
+      const touched = rt.mcpRegistration.filter((item) => item.action && item.action !== "unchanged").map((item) => item.manager);
+      if (touched.length) logInfo(rt, "MCP-запись обновлена: " + touched.join(", "));
     }
     if (!rt.version) {
       if (!rt.lastError) {

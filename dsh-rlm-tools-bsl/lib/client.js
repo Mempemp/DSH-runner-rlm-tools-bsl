@@ -223,12 +223,21 @@ window.__ModuleLoader__.load({
         jsxs("div", { style: styles.card, children: [
           jsxs("div", { style: styles.row, children: [
             jsx("span", { style: { fontSize: 13, fontWeight: 600 }, children: "Подключение к DSH" }),
-            jsx("span", { style: styles.hint, children: "Settings → MCP Server Manager → Add" }),
             jsx("div", { style: { flex: "1 1 auto" } }),
             jsx("button", { type: "button", style: styles.secondaryButton, onClick: copySnippet, children: "Скопировать JSON" }),
           ]}),
           jsx("pre", { style: styles.snippet, children: state.mcp.snippet }),
-          jsx("div", { style: styles.hint, children: "Инструменты появятся как mcp__" + state.mcp.serverName + "__rlm_start, mcp__" + state.mcp.serverName + "__rlm_execute и т. д." }),
+          jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 2 }, children: [
+            (state.mcp.registration || []).filter((item) => !item.skipped).map((item) =>
+              jsx("div", {
+                key: item.manager,
+                style: item.error ? { ...styles.hint, color: "#e57373" } : styles.hint,
+                children: item.error
+                  ? item.manager + ": ошибка записи — " + item.error
+                  : item.manager + ": " + (item.action === "added" ? "добавлено" : item.action === "updated" ? "обновлено" : "уже прописано") + " (" + item.file + ")",
+              })),
+            jsx("div", { style: styles.hint, children: "Запись в менеджер MCP плагин ведёт сам; для менеджеров, которых он не знает, добавьте JSON через их UI. Инструменты: mcp__" + state.mcp.serverName + "__rlm_start … mcp__" + state.mcp.serverName + "__rlm_end." }),
+          ]}),
         ]}),
       ]});
     }
