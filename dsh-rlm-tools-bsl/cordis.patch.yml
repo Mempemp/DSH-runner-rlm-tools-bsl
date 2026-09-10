@@ -1,0 +1,4 @@
+# dsh-rlm-tools-bsl bundle patch: подключает плагин в композицию профиля.
+- insert:
+    - id: rlm-tools-bsl
+      name: 'dsh-rlm-tools-bsl'
