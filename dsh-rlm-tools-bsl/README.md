@@ -98,10 +98,10 @@ http://127.0.0.1:9330/mcp
 **Из релиза** (скачивать ничего не нужно):
 
 ```sh
-dsh plugin --profile web add https://github.com/Mempemp/DSH-runner-rlm-tools-bsl/releases/download/v0.1.3/dsh-rlm-tools-bsl-0.1.3.tgz
+dsh plugin --profile web add https://github.com/Mempemp/DSH-runner-rlm-tools-bsl/releases/download/v0.1.4/dsh-rlm-tools-bsl-0.1.4.tgz
 ```
 
-**Локальный архив** `dsh-rlm-tools-bsl-0.1.3.tgz` (скачан со страницы релизов или собран самому: `cd dsh-rlm-tools-bsl && npm pack`):
+**Локальный архив** `dsh-rlm-tools-bsl-0.1.4.tgz` (скачан со страницы релизов или собран самому: `cd dsh-rlm-tools-bsl && npm pack`):
 
 ```sh
 dsh plugin --profile web add dsh-rlm-tools-bsl-0.1.0.tgz
