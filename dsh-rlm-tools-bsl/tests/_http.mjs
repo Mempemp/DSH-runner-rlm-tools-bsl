@@ -4,10 +4,10 @@
 //
 // Запуск: node tests/_http.mjs
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 const PORT = 9331;
 const DSH_HOME = mkdtempSync(join(tmpdir(), "dsh-rlm-test-"));
@@ -198,22 +198,25 @@ try {
   await new Promise((done) => server2.close(done));
 
   // ── 9. автопрописка в менеджеры MCP ─────────────────────────────────────
-  const mcpA = join(DSH_HOME, "mcp-servers.json");
-  const mcpB = join(DSH_HOME, "dsh-mcp.json");
-  writeFileSync(mcpA, JSON.stringify({ version: 1, servers: [{ serverName: "чужой", transport: "streamable-http", url: "http://127.0.0.1:1/mcp", enabled: true }] }, null, 2));
-  writeFileSync(mcpB, JSON.stringify({ version: 1, servers: [{ name: "чужой2", transport: "stdio", command: "x" }] }, null, 2));
+  // Менеджер 0.2.5+ читает список в своей папке; файл в корне $DSH_HOME остался
+  // от версий до 0.2.5 и в панели не виден — в него писать нельзя.
+  const managerStore = join(DSH_HOME, "@wingsky-1", "dsh-mcp-manager", "mcp.json");
+  const legacyStore = join(DSH_HOME, "dsh-mcp.json");
+  mkdirSync(dirname(managerStore), { recursive: true });
+  writeFileSync(managerStore, JSON.stringify({ version: 1, servers: [{ name: "чужой", transport: "streamable-http", url: "http://127.0.0.1:1/mcp", enabled: true }] }, null, 2));
+  writeFileSync(legacyStore, JSON.stringify({ version: 1, servers: [{ name: "остаток", transport: "stdio", command: "x" }] }, null, 2));
 
   const startedForMcp = await api("/rlm/start", { method: "POST" });
-  const storeA = JSON.parse(readFileSync(mcpA, "utf-8"));
-  const storeB = JSON.parse(readFileSync(mcpB, "utf-8"));
-  check("rlm добавлен в mcp-servers.json (serverName)", storeA.servers.some((s) => s.serverName === "rlm" && s.url === `http://127.0.0.1:${PORT}/mcp`));
-  check("rlm добавлен в dsh-mcp.json (name)", storeB.servers.some((s) => s.name === "rlm" && s.url === `http://127.0.0.1:${PORT}/mcp`));
-  check("чужие записи не тронуты", storeA.servers.some((s) => s.serverName === "чужой") && storeB.servers.some((s) => s.name === "чужой2"));
+  const current = JSON.parse(readFileSync(managerStore, "utf-8"));
+  check("rlm добавлен в хранилище менеджера 0.2.5+ (name)", current.servers.some((s) => s.name === "rlm" && s.url === `http://127.0.0.1:${PORT}/mcp`));
+  check("посторонняя запись сохранена", current.servers.some((s) => s.name === "чужой"));
+  check("файл-предшественник не тронут", JSON.parse(readFileSync(legacyStore, "utf-8")).servers.every((s) => s.name !== "rlm"));
   check("состояние показывает прописку", (startedForMcp.data?.mcp?.registration || []).some((item) => item.action === "added"));
 
   const restartedForMcp = await api("/rlm/restart", { method: "POST" });
-  const storeA2 = JSON.parse(readFileSync(mcpA, "utf-8"));
-  check("повторный запуск не дублирует и не меняет запись", storeA2.servers.filter((s) => s.serverName === "rlm").length === 1 && (restartedForMcp.data?.mcp?.registration || []).every((item) => item.action === "unchanged"));
+  const current2 = JSON.parse(readFileSync(managerStore, "utf-8"));
+  const ours = (restartedForMcp.data?.mcp?.registration || []).filter((item) => item.manager === "@wingsky-1/dsh-mcp-manager");
+  check("повторный запуск не дублирует и не меняет запись", current2.servers.filter((s) => s.name === "rlm").length === 1 && ours.length === 1 && ours[0].action === "unchanged", JSON.stringify(restartedForMcp.data?.mcp?.registration ?? null).slice(0, 160));
 } catch (error) {
   console.log("FAIL — исключение в сценарии: " + (error?.stack || error));
   exitCode = 1;

@@ -58,10 +58,72 @@ const PYTHON_DIR = join(DIR, "python");
 
 // Известные менеджеры MCP и их хранилища: файл и поле с именем сервера.
 const PROFILES_DIR = join(DSH_HOME, "profiles");
-const MANAGER_STORES = [
-  { manager: "dsh-mcp-manager", pkg: "dsh-mcp-manager", file: join(DSH_HOME, "mcp-servers.json"), nameField: "serverName" },
-  { manager: "@wingsky-1/dsh-mcp-manager", pkg: "@wingsky-1/dsh-mcp-manager", file: join(DSH_HOME, "dsh-mcp.json"), nameField: "name" },
-];
+const MCP_MANAGER_PACKAGE = "@wingsky-1/dsh-mcp-manager";
+// С 0.2.5 менеджер держит список серверов в своей папке. Файл в корне $DSH_HOME
+// остался от версий до 0.2.5: сам менеджер переносит его в новое место и убирает.
+const MCP_MANAGER_HOME = join(DSH_HOME, MCP_MANAGER_PACKAGE);
+const MCP_MANAGER_STORE = join(MCP_MANAGER_HOME, "mcp.json");
+const MCP_MANAGER_LEGACY_STORE = join(DSH_HOME, "dsh-mcp.json");
+
+// Менеджер читает ровно один файл: свой (0.2.5+) либо файл-предшественник в корне
+// $DSH_HOME. Раскладку видно по его папке — её он заводит при первом запуске, —
+// а пока её нет, версию спрашиваем у установленного пакета.
+const MCP_MANAGER_LAYOUT_SINCE = [0, 2, 5]; // 0.2.5 — с неё список переехал в свою папку
+
+function managerDirs() {
+  const candidates = [join(PROFILES_DIR, "node_modules", MCP_MANAGER_PACKAGE)];
+  try {
+    for (const entry of readdirSync(PROFILES_DIR, { withFileTypes: true })) {
+      if (entry.isDirectory()) candidates.push(join(PROFILES_DIR, entry.name, "node_modules", MCP_MANAGER_PACKAGE));
+    }
+  } catch {
+    // профилей ещё нет
+  }
+  return candidates.filter((dir) => existsSync(dir));
+}
+
+function managerVersion() {
+  for (const dir of managerDirs()) {
+    try {
+      const version = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).version;
+      if (typeof version === "string") return version;
+    } catch {
+      // недоступный package.json — смотрим следующий профиль
+    }
+  }
+  return "";
+}
+
+// Раскладка менеджера: своя папка или её файл — новая; файл-предшественник на
+// диске — старая (его ещё переносит сам менеджер). Ничего нет — смотрим версию
+// установленного пакета, а без пакета считаем раскладку актуальной.
+function storeLayoutIsCurrent() {
+  if (existsSync(MCP_MANAGER_STORE) || existsSync(MCP_MANAGER_HOME)) return true;
+  if (existsSync(MCP_MANAGER_LEGACY_STORE)) return false;
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(managerVersion());
+  if (!match) return true;
+  const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+  for (let index = 0; index < parts.length; index += 1) {
+    if (parts[index] !== MCP_MANAGER_LAYOUT_SINCE[index]) return parts[index] > MCP_MANAGER_LAYOUT_SINCE[index];
+  }
+  return true;
+}
+
+function managerStorePath() {
+  return storeLayoutIsCurrent() ? MCP_MANAGER_STORE : MCP_MANAGER_LEGACY_STORE;
+}
+
+function managerStores() {
+  return [
+    {
+      manager: storeLayoutIsCurrent() ? MCP_MANAGER_PACKAGE : `${MCP_MANAGER_PACKAGE} (до 0.2.5)`,
+      pkg: MCP_MANAGER_PACKAGE,
+      file: managerStorePath(),
+      nameField: "name",
+    },
+    { manager: "dsh-mcp-manager", pkg: "dsh-mcp-manager", file: join(DSH_HOME, "mcp-servers.json"), nameField: "serverName" },
+  ];
+}
 
 // ── утилиты ────────────────────────────────────────────────────────────────
 
@@ -247,6 +309,7 @@ function launchArgs(cfg) {
 
 // Менеджер установлен хотя бы в одном профиле?
 function managerInstalled(pkg) {
+  if (pkg === MCP_MANAGER_PACKAGE) return managerDirs().length > 0;
   const candidates = [join(PROFILES_DIR, "node_modules", pkg)];
   try {
     for (const entry of readdirSync(PROFILES_DIR, { withFileTypes: true })) {
@@ -268,7 +331,7 @@ function storeEntry(target, url) {
 // найденного в профилях. Запись с нашим именем обновляется, остальные не трогаются.
 function registerInManagers(url) {
   const results = [];
-  for (const target of MANAGER_STORES) {
+  for (const target of managerStores()) {
     try {
       const exists = existsSync(target.file);
       if (!exists && !managerInstalled(target.pkg)) {
