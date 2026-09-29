@@ -18,7 +18,7 @@ const ROUTE = "/rlm";
 const SERVER_NAME = "rlm-tools-bsl";
 const MCP_SERVER_NAME = "rlm";
 const HOST = "127.0.0.1";
-const PLUGIN_VERSION = "0.1.4";
+const PLUGIN_VERSION = "0.1.6";
 const SCHEMA = "dsh-rlm-tools-bsl/v1";
 const DEFAULT_PORT = 9330;
 const START_TIMEOUT_MS = 30_000;
@@ -307,6 +307,9 @@ function launchArgs(cfg) {
 
 // ── менеджеры MCP ──────────────────────────────────────────────────────────
 
+// Сервис менеджера MCP в контексте хаба (его ctx.provide("mcpManager")).
+const MANAGER_SERVICE = "mcpManager";
+
 // Менеджер установлен хотя бы в одном профиле?
 function managerInstalled(pkg) {
   if (pkg === MCP_MANAGER_PACKAGE) return managerDirs().length > 0;
@@ -362,6 +365,25 @@ function registerInManagers(url) {
     }
   }
   return results;
+}
+
+// Менеджер MCP судит запись один раз: пока открыто его окно загрузки, он ждёт поверхность
+// инструментов, и без неё оставляет запись неподключённой до ручного действия. Наш сервер
+// отвечает позже этого окна (python поднимается около десяти секунд), поэтому после готовности
+// просим менеджер пересмонтировать запись — тогда состояние пересчитается само. Сервис
+// необязательный: без менеджера или на старых версиях просто ничего не делаем.
+async function syncManagerRecord(rt) {
+  const manager = rt.ctx?.get?.(MANAGER_SERVICE);
+  if (!manager || typeof manager.reconnect !== "function") return;
+  try {
+    const status = typeof manager.getStatus === "function" ? manager.getStatus(MCP_SERVER_NAME) : null;
+    // Живое соединение не рвём: пересмонтировать нужно только застрявший вердикт.
+    if (status && status.status === "connected") return;
+    await manager.reconnect(MCP_SERVER_NAME);
+    logInfo(rt, "менеджер MCP: запись пересмонтирована после готовности сервера");
+  } catch (error) {
+    logInfo(rt, "менеджер MCP: пересмонтировать запись не удалось — " + (error?.message || String(error)));
+  }
 }
 
 // ── внешние процессы ───────────────────────────────────────────────────────
@@ -666,6 +688,7 @@ async function startServer(rt) {
       rt.startedAt = Date.now();
       if (config.mcpAutoRegister) rt.mcpRegistration = registerInManagers(`http://${HOST}:${config.port}/mcp`);
       logInfo(rt, `сервер уже работает (pid ${rt.adopted.pid ?? "?"}), подключаюсь как внешний`);
+      if (config.mcpAutoRegister) await syncManagerRecord(rt);
       return snapshot(rt);
     }
     if (existing.serverName) {
@@ -743,6 +766,7 @@ async function startServer(rt) {
       rt.mcpRegistration = registerInManagers(`http://${HOST}:${config.port}/mcp`);
       const touched = rt.mcpRegistration.filter((item) => item.action && item.action !== "unchanged").map((item) => item.manager);
       if (touched.length) logInfo(rt, "MCP-запись обновлена: " + touched.join(", "));
+      await syncManagerRecord(rt);
     }
     if (!rt.version) {
       if (!rt.lastError) {
