@@ -71,7 +71,7 @@ function fakeServer(port) {
       return;
     }
     const body =
-      'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"rlm-tools-bsl","version":"1.39.0"}}}\n\n';
+      'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"rlm-tools-bsl","version":"1.42.0"}}}\n\n';
     res.writeHead(200, { "content-type": "text/event-stream" }).end(body);
   });
   return new Promise((done) => server.listen(port, "127.0.0.1", () => done(server)));
